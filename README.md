@@ -17,10 +17,11 @@
 9. [Instalar y configurar Nginx](#9-instalar-y-configurar-nginx)
 10. [Desplegar el sitio web estático](#10-desplegar-el-sitio-web-estático)
 11. [Verificar el sitio en el navegador](#11-verificar-el-sitio-en-el-navegador)
-12. [Stretch goals](#12-stretch-goals)
-13. [Limpieza de recursos](#13-limpieza-de-recursos)
-14. [Resultados de aprendizaje](#14-resultados-de-aprendizaje)
-15. [Solución de problemas](#15-solución-de-problemas)
+12. [Hacer lo mismo en Floci (emulador local de AWS)](#12-hacer-lo-mismo-en-floci-emulador-local-de-aws)
+13. [Stretch goals](#13-stretch-goals)
+14. [Limpieza de recursos](#14-limpieza-de-recursos)
+15. [Resultados de aprendizaje](#15-resultados-de-aprendizaje)
+16. [Solución de problemas](#16-solución-de-problemas)
 
 ---
 
@@ -385,9 +386,150 @@ Deberías ver el HTML desplegado. 🎉
 
 ---
 
-## 12. Stretch goals
+## 12. Hacer lo mismo en Floci (emulador local de AWS)
 
-### 12.1. Dominio personalizado con Amazon Route 53
+> **Alternativa 100 % local y gratuita:** en lugar de lanzar una instancia real en AWS (pasos 2–11), puedes reproducir el mismo flujo con [Floci](https://floci.io), un emulador open source de AWS que corre en tu máquina. Las "instancias EC2" son **contenedores Docker reales**, así que los comandos de AWS CLI son casi idénticos: los mismos, solo que apuntando al endpoint local. No necesitas cuenta AWS, tarjeta de crédito ni credenciales reales.
+
+### 12.1. Requisitos previos
+
+- Docker 20.10+ y docker compose v2+ instalados
+- AWS CLI v2 (el mismo que usaste en la parte de AWS)
+- Una llave SSH local generada (`ssh-keygen`)
+
+> **Diferencia clave con AWS:** Floci importa *tu llave pública real* mediante `import-key-pair`. En Floci, `create-key-pair` devolvería una llave privada ficticia que **no** sirve para SSH.
+
+### 12.2. Instalar y arrancar Floci
+
+**Opción A — CLI oficial:**
+
+```bash
+floci start
+```
+
+**Opción B — Docker** (montando el socket para que EC2 pueda crear contenedores):
+
+```bash
+docker pull floci/floci:latest
+docker run -d --name floci \
+  -p 4566:4566 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -u root \
+  floci/floci:latest
+```
+
+Configura el entorno. El emulador acepta cualquier credencial no vacía:
+
+```bash
+eval $(floci env)
+# equivale a:
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+```
+
+Esto sustituye a los pasos 3 y 4 (configuración de credenciales de IAM y búsqueda de la AMI): aquí no hay credenciales reales ni AMIs caducables.
+
+### 12.3. Importar la llave SSH
+
+```bash
+KEY_NAME="floci-static-site-key"
+
+aws ec2 import-key-pair \
+  --key-name "$KEY_NAME" \
+  --public-key-material fileb://~/.ssh/id_rsa.pub
+```
+
+### 12.4. Red y grupo de seguridad
+
+```bash
+VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query 'Vpc.VpcId' --output text)
+SUBNET_ID=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block 10.0.1.0/24 --query 'Subnet.SubnetId' --output text)
+
+SG_ID=$(aws ec2 create-security-group \
+  --group-name "floci-static-site-sg" \
+  --description "SSH (22) y HTTP (80)" \
+  --vpc-id "$VPC_ID" \
+  --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 80 --cidr 0.0.0.0/0
+```
+
+### 12.5. Lanzar la instancia con UserData
+
+Usa la AMI local `ami-ubuntu2204` (Floci la mapea a la imagen Docker `ubuntu:22.04`). A diferencia de AWS, la configuración se hace vía `--user-data` en el arranque, que en este caso instala Nginx y crea el sitio:
+
+```bash
+INSTANCE_ID=$(aws ec2 run-instances \
+  --image-id ami-ubuntu2204 \
+  --instance-type t2.micro \
+  --key-name "$KEY_NAME" \
+  --security-group-ids "$SG_ID" \
+  --subnet-id "$SUBNET_ID" \
+  --user-data '#!/bin/bash
+apt-get update
+apt-get install -y nginx
+echo "¡Hola desde Floci!" > /var/www/html/index.html' \
+  --query 'Instances[0].InstanceId' \
+  --output text)
+
+echo "Instance ID: $INSTANCE_ID"
+```
+
+Equivalencias con la tabla del [paso 7](#7-lanzar-la-instancia-ec2): `ami-ubuntu2204` toma el lugar de `--image-id` (una AMI real caducable) y `--user-data` sustituye el paso manual de instalar Nginx por SSH.
+
+### 12.6. Verificar el sitio desde localhost
+
+No hay IP pública remota: Floci publica en tu máquina los puertos TCP abiertos en el grupo de seguridad mediante contenedores `socat`. El puerto 80 de la instancia se publica en un puerto del rango **30000–30999** (el SSH usa el rango 2200–2299). El mapeo aparece en los logs de Floci:
+
+```
+Published EC2 instance i-0abc... app port 80 on host port 30000 (socat -> 172.17.0.3:80)
+```
+
+Para descubrir el puerto publicado (o ve el sidecar `socat` con `docker ps`):
+
+```bash
+docker ps --format '{{.Names}}  {{.Ports}}'
+```
+
+Y comprueba que responde:
+
+```bash
+curl http://localhost:30000
+# ¡Hola desde Floci!
+```
+
+### 12.7. Desplegar tu propio `index.html`
+
+Del mismo modo que en el [paso 10](#10-desplegar-el-sitio-web-estático), pero copiando dentro del contenedor en lugar de `scp` al servidor remoto:
+
+```bash
+docker ps --format '{{.Names}}\t{{.Image}}'   # identifica el contenedor de la instancia
+docker cp sitio-estatico/index.html <CONTAINER_NAME>:/var/www/html/index.html
+docker exec <CONTAINER_NAME> nginx -s reload
+```
+
+Si prefieres el flujo SSH, conéctate al puerto SSH publicado de la instancia:
+
+```bash
+ssh -i ~/.ssh/id_rsa -p 2200 localhost
+```
+
+> Nota: la publicación de puertos SSH/HTTP y la inyección de la llave dependen de la configuración de Floci (por defecto, rango SSH 2200–2299 y puertos de app 30000–30999). Revisa los logs de Floci para confirmar el puerto real asignado.
+
+### 12.8. Limpieza
+
+```bash
+aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
+floci stop      # o bien: docker stop floci
+```
+
+---
+
+## 13. Stretch goals
+
+### 13.1. Dominio personalizado con Amazon Route 53
 
 1. Compra o transfiere un dominio en Route 53.
 2. Crea una zona hospedada pública:
@@ -426,7 +568,7 @@ Deberías ver el HTML desplegado. 🎉
 
 4. Actualiza los *nameservers* del registrador del dominio con los que devuelve `create-hosted-zone`.
 
-### 12.2. HTTPS con Let's Encrypt (certbot)
+### 13.2. HTTPS con Let's Encrypt (certbot)
 
 En el servidor:
 
@@ -448,7 +590,7 @@ sudo certbot renew --dry-run
 
 > Requiere que el dominio apunte ya a la IP de la instancia y que el puerto 80 esté abierto (para la validación HTTP-01).
 
-### 12.3. CI/CD con AWS CodePipeline
+### 13.3. CI/CD con AWS CodePipeline
 
 Esquema mínimo:
 
@@ -474,7 +616,7 @@ Alternativa más simple para HTML puro: **CodePipeline → S3 + CloudFront** sin
 
 ---
 
-## 13. Limpieza de recursos
+## 14. Limpieza de recursos
 
 Para evitar cargos fuera del Free Tier, termina todos los recursos cuando termines:
 
@@ -501,7 +643,7 @@ aws route53 delete-hosted-zone --id "$HOSTED_ZONE_ID"
 
 ---
 
-## 14. Resultados de aprendizaje
+## 15. Resultados de aprendizaje
 
 Al completar este proyecto habrás practicado:
 
@@ -519,7 +661,7 @@ Con estos conceptos podrás desplegar cualquiera de los proyectos anteriores (la
 
 ---
 
-## 15. Solución de problemas
+## 16. Solución de problemas
 
 | Síntoma | Causa probable | Solución |
 |---------|----------------|----------|
@@ -541,3 +683,6 @@ Con estos conceptos podrás desplegar cualquiera de los proyectos anteriores (la
 - [AWS Free Tier](https://aws.amazon.com/free/)
 - [Nginx documentation](https://nginx.org/en/docs/)
 - [Let's Encrypt / Certbot](https://certbot.eff.org/)
+- [Floci — emulador local de AWS](https://floci.io/)
+- [Floci — EC2 service docs](https://github.com/floci-io/floci/blob/main/docs/services/ec2.md)
+- [Floci — Getting started](https://github.com/floci-io/floci/blob/main/docs/getting-started/installation.md)
