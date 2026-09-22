@@ -513,7 +513,11 @@ docker exec <CONTAINER_NAME> nginx -s reload
 Si prefieres el flujo SSH, conéctate al puerto SSH publicado de la instancia:
 
 ```bash
-ssh -i ~/.ssh/id_rsa -p 2200 localhost
+ssh -i ~/.ssh/id_rsa -p 2200 root@localhost
+
+apt-get install apache2 -y
+/etc/init.d/apache2 start
+kill 2589
 ```
 
 > Nota: la publicación de puertos SSH/HTTP y la inyección de la llave dependen de la configuración de Floci (por defecto, rango SSH 2200–2299 y puertos de app 30000–30999). Revisa los logs de Floci para confirmar el puerto real asignado.
